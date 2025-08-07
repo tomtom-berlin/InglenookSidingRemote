@@ -66,6 +66,7 @@ const int SD_CS = 5;
 const int REMOTE_BOARD = 1;
 
 uint8_t peerAddress[6];
+char peer_name[64];
 uint8_t myAddress[6];
 uint8_t broadcastAddress[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
 esp_now_peer_info_t peer;
@@ -140,7 +141,7 @@ lv_obj_t* btn_restart;
 lv_obj_t* btn_refresh;
 lv_obj_t* btn_power;
 lv_obj_t* espnow_label;
-lv_obj_t* layout_label;
+lv_obj_t* layout_label = NULL;
 
 lv_obj_t* btnm1;
 const char* btnm_map[] = { "L", "1", "2", "3", "4", "\n",
@@ -182,6 +183,8 @@ void OnDataRecv(uint8_t* mac_addr, uint8_t* incomingData, uint8_t length) {
            *(incoming.mac + 4),
            *(incoming.mac + 5));
   memcpy(peerAddress, incoming.mac, 6);
+  memset(peer_name, 0, sizeof(peer_name));
+  memcpy(peer_name, incoming.txt, min(sizeof(peer_name), strlen(incoming.txt)));
   Serial.print(temp_label);
   Serial.print(" Command length: ");
   Serial.print(incoming.length);
@@ -195,7 +198,7 @@ void OnDataRecv(uint8_t* mac_addr, uint8_t* incomingData, uint8_t length) {
     memcpy(broadcastAddress, peerAddress, 6);
     esp_now_add_peer(&peer);
     pairing_status = PAIRED;
-    if(layout_label) {
+    if (layout_label != NULL) {
       lv_label_set_text(layout_label, incoming.txt);
     }
   }
@@ -278,6 +281,42 @@ void touchscreen_read(lv_indev_t* indev, lv_indev_data_t* data) {
   } else {
     data->state = LV_INDEV_STATE_RELEASED;
   }
+}
+
+LOCO_TYPE* activate_loco(LOCO_TYPE* new_loco, LOCO_TYPE* current_loco) {
+  if (new_loco != current_loco) {
+    // stop last active loco
+    if (current_loco != NULL) {
+      lv_arc_set_value(tacho, 0);
+      lv_label_set_text_fmt(label_tacho, "%d %%", 0);
+      char_cnt = snprintf(temp_cmd, sizeof(temp_cmd), "<<<l%d#h#", current_loco->address);
+      for (int i = 0; i < sizeof(btnm_map) / sizeof(btnm_map[0]); i++) {
+        if (lv_buttonmatrix_has_button_ctrl(btnm1, i, LV_BUTTONMATRIX_CTRL_CHECKED)) {
+          char_cnt = snprintf(temp_cmd + strlen(temp_cmd), sizeof(temp_cmd), "f%d#", i);
+        }
+      }
+      char_cnt = snprintf(temp_cmd + strlen(temp_cmd), sizeof(temp_cmd), ">>>");
+    }
+    forward = false;
+    reversed = false;
+    speed = 0;
+    current_loco = new_loco;
+    lv_obj_remove_state(dir_reversed, LV_STATE_CHECKED);
+    lv_obj_remove_state(dir_forward, LV_STATE_CHECKED);
+    lv_obj_remove_state(shunt_fn_f0, LV_STATE_CHECKED);
+    lv_obj_remove_state(shunt_fn_f3, LV_STATE_CHECKED);
+    lv_buttonmatrix_clear_button_ctrl_all(btnm1, LV_BUTTONMATRIX_CTRL_CHECKED);
+    if (current_loco != NULL) {
+      char_cnt = snprintf(temp_label, sizeof(temp_label), "%s", current_loco->name.c_str());
+      lv_label_set_text(tab_shunt_label, temp_label);
+      lv_label_set_text(tab_fn_label, temp_label);
+    } else {
+      lv_label_set_text(tab_shunt_label, "");
+      lv_label_set_text(tab_fn_label, "");
+    }
+  }
+  lv_spinbox_set_value(pom_spinbox_addr, (int32_t)current_loco->address);
+  return current_loco;
 }
 
 static void pom_btn_send_event_cb(lv_event_t* e) {
@@ -451,19 +490,13 @@ void fn_btnmatrix_event_cb(lv_event_t* e) {
   lv_obj_t* obj = lv_event_get_target_obj(e);
   if (code == LV_EVENT_VALUE_CHANGED) {
     uint32_t id = lv_buttonmatrix_get_selected_button(obj);
+    bool t = lv_obj_get_state(obj) & LV_STATE_CHECKED;
     if (id == 0) {
-      lv_obj_send_event(shunt_fn_f0, LV_EVENT_CLICKED, NULL);
-      if (lv_obj_get_state(shunt_fn_f0) && LV_STATE_CHECKED) {
-        lv_obj_remove_state(shunt_fn_f0, LV_STATE_CHECKED);
-      }
+      lv_obj_set_state(shunt_fn_f0, LV_STATE_CHECKED, !(lv_obj_get_state(shunt_fn_f0) & LV_STATE_CHECKED));
     } else if (id == 3) {
-      lv_obj_send_event(shunt_fn_f3, LV_EVENT_CLICKED, NULL);
-      if (lv_obj_get_state(shunt_fn_f3) && LV_STATE_CHECKED) {
-        lv_obj_remove_state(shunt_fn_f3, LV_STATE_CHECKED);
-      }
-    } else {
-      toggle_fn(id);
+      lv_obj_set_state(shunt_fn_f3, LV_STATE_CHECKED, !(lv_obj_get_state(shunt_fn_f3) & LV_STATE_CHECKED));
     }
+    toggle_fn(id);
   }
 }
 
@@ -503,42 +536,6 @@ static void loco_list_event_cb(lv_event_t* e) {
     }
     active_loco = activate_loco(temp_loco, active_loco);
   }
-}
-
-LOCO_TYPE* activate_loco(LOCO_TYPE* new_loco, LOCO_TYPE* current_loco) {
-  if (new_loco != current_loco) {
-    // stop last active loco
-    if (current_loco != NULL) {
-      lv_arc_set_value(tacho, 0);
-      lv_label_set_text_fmt(label_tacho, "%d %%", 0);
-      char_cnt = snprintf(temp_cmd, sizeof(temp_cmd), "<<<l%d#h#", current_loco->address);
-      for (int i = 0; i < sizeof(btnm_map) / sizeof(btnm_map[0]); i++) {
-        if (lv_buttonmatrix_has_button_ctrl(btnm1, i, LV_BUTTONMATRIX_CTRL_CHECKED)) {
-          char_cnt = snprintf(temp_cmd + strlen(temp_cmd), sizeof(temp_cmd), "f%d#", i);
-        }
-      }
-      char_cnt = snprintf(temp_cmd + strlen(temp_cmd), sizeof(temp_cmd), ">>>");
-    }
-    forward = false;
-    reversed = false;
-    speed = 0;
-    current_loco = new_loco;
-    lv_obj_remove_state(dir_reversed, LV_STATE_CHECKED);
-    lv_obj_remove_state(dir_forward, LV_STATE_CHECKED);
-    lv_obj_remove_state(shunt_fn_f0, LV_STATE_CHECKED);
-    lv_obj_remove_state(shunt_fn_f3, LV_STATE_CHECKED);
-    lv_buttonmatrix_clear_button_ctrl_all(btnm1, LV_BUTTONMATRIX_CTRL_CHECKED);
-    if (current_loco != NULL) {
-      char_cnt = snprintf(temp_label, sizeof(temp_label), "%s", current_loco->name.c_str());
-      lv_label_set_text(tab_shunt_label, temp_label);
-      lv_label_set_text(tab_fn_label, temp_label);
-    } else {
-      lv_label_set_text(tab_shunt_label, "");
-      lv_label_set_text(tab_fn_label, "");
-    }
-  }
-  lv_spinbox_set_value(pom_spinbox_addr, (int32_t)current_loco->address);
-  return current_loco;
 }
 
 void lv_create_tab_loco(lv_obj_t* tab) {
@@ -819,6 +816,7 @@ void set_label_espnow(PAIRING_STATUS pairing_status) {
     switch (pairing_status) {
       case PAIRED:
         lv_label_set_text(espnow_label, LV_SYMBOL_WIFI " Verbunden mit");
+        lv_label_set_text(layout_label, peer_name);
         break;
       case PAIR_REQUEST:
       case PAIR_REQUESTED:
@@ -982,7 +980,7 @@ PAIRING_STATUS autoPair() {
   return pairing_status;
 }
 
-void get_mac(uint8_t * mac) {
+void get_mac(uint8_t* mac) {
   String MAC = WiFi.macAddress();
   MAC = "0x" + MAC;
   MAC.replace(":", ":0x");
@@ -1041,7 +1039,7 @@ void setup() {
 
 void loop() {
   if (autoPair() == PAIRED) {
-    set_label_espnow(pairing_status);
+    // set_label_espnow(pairing_status);
     if (strlen(temp_cmd)) {
       send_outgoing(temp_cmd);
       *temp_cmd = 0x0;
