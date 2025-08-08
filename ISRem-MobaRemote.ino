@@ -1,3 +1,26 @@
+/*
+Fernbedienung für die Steuerung des Inglenook Siding mit DCC-Zentrale "PicoLo"
+Läuft auf Cheap Yellow Display ESP32-2432S028R via ESP-Now, Empfänger: ESP32-C3 Supermicro mit UART-Anbindung an RP2040 o. RP2350
+Die Kommunikation ist unverschlüsselt
+
+- Autopairing 
+- Kommandostructur:
+  Präambel (<<<) {Kommando}# Suffix (>>>)
+  Jedes Kommando für Lok und Zubehör wird mit # beendet und besteht aus:
+  L für Lok
+  W für Weiche
+  P für PoM - Lok
+  A für PoM - Accessory
+
+  Kommandos für das Layout::
+  QUIT : Layout und FB ausschalten
+  RESET: Layout auf Grundstellung bringen
+  EMERG: Layout Nothalt
+
+  z. B. <<<L3,V0,F3#>>>: Lok mit Adresse 3 Vorwärts, Fahrstufe 0, Funktion 3 umschalten
+        <<<QUIT>>> Layout und Fernbedienung ausschalten
+*/
+
 #include <lvgl.h>
 #include <TFT_eSPI.h>
 #include <XPT2046_Touchscreen.h>
@@ -44,7 +67,7 @@ typedef struct {
   char txt[224];
 } MESSAGE_TYPE;
 
-const char* VERSION[] = { "0", "1&", "20250807.1555" };
+const char* VERSION[] = { "0", "5&", "20250808.1610" };
 
 #define FONT_SMALL &lv_font_montserrat_10
 #define FONT_H3 &lv_font_montserrat_20
@@ -64,6 +87,8 @@ const uint8_t XPT2046_CS = 33;    // T_CS
 const int SD_CS = 5;
 
 const int REMOTE_BOARD = 1;
+const uint32_t SD_TIMEOUT = 5e3;
+const uint32_t PAIRING_FREQ = 3e3;
 
 uint8_t peerAddress[6];
 char peer_name[64];
@@ -135,7 +160,8 @@ lv_obj_t* pom_btn_cv_inc;
 lv_obj_t* pom_spinbox_value;
 lv_obj_t* pom_btn_value_dec;
 lv_obj_t* pom_btn_value_inc;
-lv_obj_t* pom_btn_send;
+lv_obj_t* pom_btn_send_multi;
+lv_obj_t* pom_btn_send_accessory;
 lv_obj_t* mbox_route_error;
 lv_obj_t* btn_restart;
 lv_obj_t* btn_refresh;
@@ -198,9 +224,8 @@ void OnDataRecv(uint8_t* mac_addr, uint8_t* incomingData, uint8_t length) {
     memcpy(broadcastAddress, peerAddress, 6);
     esp_now_add_peer(&peer);
     pairing_status = PAIRED;
-    if (layout_label != NULL) {
-      lv_label_set_text(layout_label, incoming.txt);
-    }
+  }
+  else if (incoming.msg_type == DATA) {  // Get loco state if applicable
   }
 }
 
@@ -283,46 +308,55 @@ void touchscreen_read(lv_indev_t* indev, lv_indev_data_t* data) {
   }
 }
 
-LOCO_TYPE* activate_loco(LOCO_TYPE* new_loco, LOCO_TYPE* current_loco) {
-  if (new_loco != current_loco) {
+void halt() {
     // stop last active loco
-    if (current_loco != NULL) {
-      lv_arc_set_value(tacho, 0);
-      lv_label_set_text_fmt(label_tacho, "%d %%", 0);
-      char_cnt = snprintf(temp_cmd, sizeof(temp_cmd), "<<<l%d#h#", current_loco->address);
-      for (int i = 0; i < sizeof(btnm_map) / sizeof(btnm_map[0]); i++) {
-        if (lv_buttonmatrix_has_button_ctrl(btnm1, i, LV_BUTTONMATRIX_CTRL_CHECKED)) {
-          char_cnt = snprintf(temp_cmd + strlen(temp_cmd), sizeof(temp_cmd), "f%d#", i);
-        }
+  if (active_loco != NULL) {
+    char_cnt = snprintf(temp_cmd, sizeof(temp_cmd), "<<<L%d,H", active_loco->address);
+    for (int i = 0; i < sizeof(btnm_map) / sizeof(btnm_map[0]); i++) {
+      if (lv_buttonmatrix_has_button_ctrl(btnm1, i, LV_BUTTONMATRIX_CTRL_CHECKED)) {
+        char_cnt = snprintf(temp_cmd + strlen(temp_cmd), sizeof(temp_cmd), ",F%d", i);
       }
-      char_cnt = snprintf(temp_cmd + strlen(temp_cmd), sizeof(temp_cmd), ">>>");
     }
-    forward = false;
-    reversed = false;
-    speed = 0;
-    current_loco = new_loco;
-    lv_obj_remove_state(dir_reversed, LV_STATE_CHECKED);
-    lv_obj_remove_state(dir_forward, LV_STATE_CHECKED);
-    lv_obj_remove_state(shunt_fn_f0, LV_STATE_CHECKED);
-    lv_obj_remove_state(shunt_fn_f3, LV_STATE_CHECKED);
-    lv_buttonmatrix_clear_button_ctrl_all(btnm1, LV_BUTTONMATRIX_CTRL_CHECKED);
-    if (current_loco != NULL) {
-      char_cnt = snprintf(temp_label, sizeof(temp_label), "%s", current_loco->name.c_str());
-      lv_label_set_text(tab_shunt_label, temp_label);
-      lv_label_set_text(tab_fn_label, temp_label);
-    } else {
-      lv_label_set_text(tab_shunt_label, "");
-      lv_label_set_text(tab_fn_label, "");
-    }
+    char_cnt = snprintf(temp_cmd + strlen(temp_cmd), sizeof(temp_cmd), "#>>>");
   }
-  lv_spinbox_set_value(pom_spinbox_addr, (int32_t)current_loco->address);
-  return current_loco;
+  active_loco = NULL;
+}
+
+
+LOCO_TYPE* activate_loco(LOCO_TYPE* new_loco) {
+  lv_arc_set_value(tacho, 0);
+  lv_label_set_text_fmt(label_tacho, "%d %%", 0);
+  forward = false;
+  reversed = false;
+  speed = 0;
+  lv_obj_remove_state(dir_reversed, LV_STATE_CHECKED);
+  lv_obj_remove_state(dir_forward, LV_STATE_CHECKED);
+  lv_obj_remove_state(shunt_fn_f0, LV_STATE_CHECKED);
+  lv_obj_remove_state(shunt_fn_f3, LV_STATE_CHECKED);
+  lv_buttonmatrix_clear_button_ctrl_all(btnm1, LV_BUTTONMATRIX_CTRL_CHECKED);
+  if (new_loco != NULL) {
+    char_cnt = snprintf(temp_label, sizeof(temp_label), "%s", new_loco->name.c_str());
+    lv_label_set_text(tab_shunt_label, temp_label);
+    lv_label_set_text(tab_fn_label, temp_label);
+  } else {
+    lv_label_set_text(tab_shunt_label, "");
+    lv_label_set_text(tab_fn_label, "");
+  }
+
+  lv_spinbox_set_value(pom_spinbox_addr, (int32_t)new_loco->address);
+  return new_loco;
 }
 
 static void pom_btn_send_event_cb(lv_event_t* e) {
   lv_event_code_t code = lv_event_get_code(e);
+  lv_obj_t* obj = lv_event_get_target_obj(e);
   if (code == LV_EVENT_CLICKED) {
-    char_cnt = snprintf(temp_cmd, sizeof(temp_cmd), "<<<%c%d,%d,%d#>>>", 'p', lv_spinbox_get_value(pom_spinbox_addr), lv_spinbox_get_value(pom_spinbox_cv), lv_spinbox_get_value(pom_spinbox_value));
+    if (obj == pom_btn_send_multi) {
+      char_cnt = snprintf(temp_cmd, sizeof(temp_cmd), "<<<%c%d,%d,%d#>>>", 'P', lv_spinbox_get_value(pom_spinbox_addr), lv_spinbox_get_value(pom_spinbox_cv), lv_spinbox_get_value(pom_spinbox_value));
+    }
+    if (obj == pom_btn_send_accessory) {
+      char_cnt = snprintf(temp_cmd, sizeof(temp_cmd), "<<<%c%d,%d,%d#>>>", 'A', lv_spinbox_get_value(pom_spinbox_addr), lv_spinbox_get_value(pom_spinbox_cv), lv_spinbox_get_value(pom_spinbox_value));
+    }
   }
 }
 
@@ -330,13 +364,15 @@ static void address_btn_ok_event_cb(lv_event_t* e) {
   lv_event_code_t code = lv_event_get_code(e);
 
   if (code == LV_EVENT_CLICKED) {
+    halt();
     locos[0] = {
-      "Namenlos",
+      "Addresse " + (String)lv_spinbox_get_value(address_spinbox_addr),
       lv_spinbox_get_value(address_spinbox_addr),
       128,
       0
     };
-    active_loco = activate_loco(&locos[0], active_loco);
+    active_loco = activate_loco(&locos[0]);
+    char_cnt = snprintf(temp_cmd, sizeof(temp_cmd), "<<<%c%d#>>>", 'G', lv_spinbox_get_value(address_spinbox_addr));
   }
 }
 
@@ -408,8 +444,8 @@ static void tacho_released_event_cb(lv_event_t* e) {
     lv_label_set_text_fmt(label_tacho, "%d %%", speed);
     // LV_LOG_USER("Tacho released @ %i %i %d ", reversed, forward, (int)active_loco->address);
     if (forward ^ reversed) {
-      char dir = active_loco->invers ? (reversed ? 'v' : 'r') : (forward ? 'v' : 'r');
-      char_cnt = snprintf(temp_cmd, sizeof(temp_cmd), "<<<l%d#%c%d#>>>", (int)active_loco->address, dir, speed);
+      char dir = active_loco->invers ? (reversed ? 'V' : 'R') : (forward ? 'V' : 'R');
+      char_cnt = snprintf(temp_cmd, sizeof(temp_cmd), "<<<L%d,%c%d#>>>", (int)active_loco->address, dir, speed);
     }
   } else if (code == LV_EVENT_VALUE_CHANGED) {
     lv_label_set_text_fmt(label_tacho, "%d %%", lv_arc_get_value(tacho));
@@ -449,7 +485,7 @@ static void dir_forward_event_cb(lv_event_t* e) {
 void stop_event_cb(lv_event_t* e) {
   lv_event_code_t code = lv_event_get_code(e);
   if (code == LV_EVENT_CLICKED) {
-    char_cnt = snprintf(temp_cmd, sizeof(temp_cmd), "<<<l%d#h#>>>", (int)active_loco->address);
+    char_cnt = snprintf(temp_cmd, sizeof(temp_cmd), "<<<L%d,H#>>>", (int)active_loco->address);
     // LV_LOG_USER("Stop clicked @ %d ", (int)active_loco->address);
     forward = reversed = false;
     lv_obj_remove_state(dir_forward, LV_STATE_CHECKED);
@@ -458,13 +494,13 @@ void stop_event_cb(lv_event_t* e) {
 }
 
 void toggle_fn(int fn) {
-  char_cnt = snprintf(temp_cmd, sizeof(temp_cmd), "<<<l%d#f%d#>>>", (int)active_loco->address, fn);
+  char_cnt = snprintf(temp_cmd, sizeof(temp_cmd), "<<<L%d,F%d#>>>", (int)active_loco->address, fn);
 }
 
 void shunt_fn_f0_event_cb(lv_event_t* e) {
   lv_event_code_t code = lv_event_get_code(e);
   if (code == LV_EVENT_CLICKED) {
-    if (lv_obj_get_state(shunt_fn_f0) && LV_STATE_CHECKED) {
+    if (lv_obj_get_state(shunt_fn_f0) & LV_STATE_CHECKED) {
       lv_buttonmatrix_set_button_ctrl(btnm1, 0, LV_BUTTONMATRIX_CTRL_CHECKED);
     } else {
       lv_buttonmatrix_clear_button_ctrl(btnm1, 0, LV_BUTTONMATRIX_CTRL_CHECKED);
@@ -476,7 +512,7 @@ void shunt_fn_f0_event_cb(lv_event_t* e) {
 void shunt_fn_f3_event_cb(lv_event_t* e) {
   lv_event_code_t code = lv_event_get_code(e);
   if (code == LV_EVENT_CLICKED) {
-    if (lv_obj_get_state(shunt_fn_f3) && LV_STATE_CHECKED) {
+    if (lv_obj_get_state(shunt_fn_f3) & LV_STATE_CHECKED) {
       lv_buttonmatrix_set_button_ctrl(btnm1, 3, LV_BUTTONMATRIX_CTRL_CHECKED);
     } else {
       lv_buttonmatrix_clear_button_ctrl(btnm1, 3, LV_BUTTONMATRIX_CTRL_CHECKED);
@@ -502,12 +538,10 @@ void fn_btnmatrix_event_cb(lv_event_t* e) {
 
 static void btn_restart_event_cb(lv_event_t* e) {
   char_cnt = snprintf(temp_cmd, sizeof(temp_cmd), "%s", "<<<EMERG>>>");
-  ESP.restart();
 }
 
 static void btn_refresh_event_cb(lv_event_t* e) {
   char_cnt = snprintf(temp_cmd, sizeof(temp_cmd), "%s", "<<<RESET>>>");
-  ESP.restart();
 }
 
 static void btn_power_event_cb(lv_event_t* e) {
@@ -534,7 +568,8 @@ static void loco_list_event_cb(lv_event_t* e) {
         lv_obj_remove_style(child, &style_bg_lightblue, 0);
       }
     }
-    active_loco = activate_loco(temp_loco, active_loco);
+    active_loco = activate_loco(temp_loco);
+    char_cnt = snprintf(temp_cmd, sizeof(temp_cmd), "<<<%c%d#>>>", 'G', active_loco->address);
   }
 }
 
@@ -557,15 +592,15 @@ void lv_create_tab_loco(lv_obj_t* tab) {
 
 void lv_create_tab_pom(lv_obj_t* tab) {
   lv_obj_t* label = lv_label_create(tab);
-  lv_label_set_text(label, "Adresse: ");
-  lv_obj_align(label, LV_ALIGN_CENTER, -120, -65);
+  lv_label_set_text(label, "Adresse:");
+  lv_obj_align(label, LV_ALIGN_CENTER, -108, -65);
 
   pom_spinbox_addr = lv_spinbox_create(tab);
   lv_spinbox_set_range(pom_spinbox_addr, 1, 10239);
   lv_spinbox_set_digit_format(pom_spinbox_addr, 5, 0);
   // lv_spinbox_step_prev(pom_spinbox_addr);
   lv_obj_set_width(pom_spinbox_addr, 100);
-  lv_obj_align(pom_spinbox_addr, LV_ALIGN_CENTER, 30, -65);
+  lv_obj_align(pom_spinbox_addr, LV_ALIGN_CENTER, 42, -65);
 
   int32_t h = lv_obj_get_height(pom_spinbox_addr);
 
@@ -582,15 +617,15 @@ void lv_create_tab_pom(lv_obj_t* tab) {
   lv_obj_add_event_cb(pom_btn_addr_dec, lv_spinbox_change_value_event_cb, LV_EVENT_ALL, NULL);
 
   label = lv_label_create(tab);
-  lv_label_set_text(label, "CV: ");
-  lv_obj_align(label, LV_ALIGN_CENTER, -120, -20);
+  lv_label_set_text(label, "     CV:");
+  lv_obj_align(label, LV_ALIGN_CENTER, -108, -8);
 
   pom_spinbox_cv = lv_spinbox_create(tab);
   lv_spinbox_set_range(pom_spinbox_cv, 2, 1024);
   lv_spinbox_set_digit_format(pom_spinbox_cv, 4, 0);
   // lv_spinbox_step_prev(pom_spinbox_cv);
   lv_obj_set_width(pom_spinbox_cv, 100);
-  lv_obj_align(pom_spinbox_cv, LV_ALIGN_CENTER, 30, -20);
+  lv_obj_align(pom_spinbox_cv, LV_ALIGN_CENTER, 42, -20);
 
   h = lv_obj_get_height(pom_spinbox_cv);
 
@@ -607,15 +642,15 @@ void lv_create_tab_pom(lv_obj_t* tab) {
   lv_obj_add_event_cb(pom_btn_cv_dec, lv_spinbox_change_value_event_cb, LV_EVENT_ALL, NULL);
 
   label = lv_label_create(tab);
-  lv_label_set_text(label, "Wert: ");
-  lv_obj_align(label, LV_ALIGN_CENTER, -120, 40);
+  lv_label_set_text(label, "   Wert:");
+  lv_obj_align(label, LV_ALIGN_CENTER, -108, 25);
 
   pom_spinbox_value = lv_spinbox_create(tab);
   lv_spinbox_set_range(pom_spinbox_value, 0, 255);
   lv_spinbox_set_digit_format(pom_spinbox_value, 3, 0);
   // lv_spinbox_step_prev(pom_spinbox_value);
   lv_obj_set_width(pom_spinbox_value, 100);
-  lv_obj_align(pom_spinbox_value, LV_ALIGN_CENTER, 30, 40);
+  lv_obj_align(pom_spinbox_value, LV_ALIGN_CENTER, 42, 25);
 
   h = lv_obj_get_height(pom_spinbox_value);
 
@@ -631,20 +666,30 @@ void lv_create_tab_pom(lv_obj_t* tab) {
   lv_obj_set_style_bg_image_src(pom_btn_value_dec, LV_SYMBOL_MINUS, 0);
   lv_obj_add_event_cb(pom_btn_value_dec, lv_spinbox_change_value_event_cb, LV_EVENT_ALL, NULL);
 
-  pom_btn_send = lv_button_create(tab);
-  lv_obj_add_event_cb(pom_btn_send, pom_btn_send_event_cb, LV_EVENT_ALL, NULL);
-  lv_obj_align_to(pom_btn_send, pom_btn_value_inc, LV_ALIGN_OUT_BOTTOM_MID, -16, 16);
-  lv_obj_remove_flag(pom_btn_send, LV_OBJ_FLAG_PRESS_LOCK);
+  pom_btn_send_accessory = lv_button_create(tab);
+  lv_obj_add_event_cb(pom_btn_send_accessory, pom_btn_send_event_cb, LV_EVENT_ALL, NULL);
+  lv_obj_align(pom_btn_send_accessory, LV_ALIGN_CENTER, -80, 70);
+  lv_obj_remove_flag(pom_btn_send_accessory, LV_OBJ_FLAG_PRESS_LOCK);
 
-  label = lv_label_create(pom_btn_send);
-  lv_label_set_text(label, LV_SYMBOL_UPLOAD);
+  label = lv_label_create(pom_btn_send_accessory);
+  lv_label_set_text(label, "Zubehoer " LV_SYMBOL_UPLOAD);
+  lv_obj_center(label);
+
+  pom_btn_send_multi = lv_button_create(tab);
+  lv_obj_add_event_cb(pom_btn_send_multi, pom_btn_send_event_cb, LV_EVENT_ALL, NULL);
+  lv_obj_align(pom_btn_send_multi, LV_ALIGN_CENTER, 72, 70);
+  lv_obj_remove_flag(pom_btn_send_multi, LV_OBJ_FLAG_PRESS_LOCK);
+
+  label = lv_label_create(pom_btn_send_multi);
+  lv_label_set_text(label, "Lokdecoder " LV_SYMBOL_UPLOAD);
   lv_obj_center(label);
 }
 
 void lv_create_tab_address(lv_obj_t* tab) {
   lv_obj_t* label = lv_label_create(tab);
+  lv_obj_add_style(label, &style_header_3, 0);
   lv_label_set_text(label, "Adress-Modus:");
-  lv_obj_align(label, LV_ALIGN_CENTER, 0, -100);
+  lv_obj_align(label, LV_ALIGN_CENTER, 0, -80);
 
   address_spinbox_addr = lv_spinbox_create(tab);
   lv_spinbox_set_range(address_spinbox_addr, 1, 10239);
@@ -680,7 +725,7 @@ void lv_create_block_fn(lv_obj_t* tab) {
   btnm1 = lv_buttonmatrix_create(tab);
   lv_buttonmatrix_set_map(btnm1, btnm_map);
   lv_buttonmatrix_set_button_ctrl_all(btnm1, LV_BUTTONMATRIX_CTRL_CHECKABLE);
-  lv_obj_align(btnm1, LV_ALIGN_CENTER, 0, 32);
+  lv_obj_align(btnm1, LV_ALIGN_CENTER, 0, 24);
   lv_obj_add_event_cb(btnm1, fn_btnmatrix_event_cb, LV_EVENT_ALL, NULL);
 }
 
@@ -713,6 +758,7 @@ void lv_create_tacho(lv_obj_t* tab) {
 void lv_create_tab_shunt(lv_obj_t* tab) {
   // Create a slider aligned in the center bottom of the TFT display
   tab_shunt_label = lv_label_create(tab);
+  lv_obj_add_style(tab_shunt_label, &style_header_3, 0);
   lv_obj_align(tab_shunt_label, LV_ALIGN_TOP_MID, 0, 0);
   if (active_loco != NULL) {
     lv_label_set_text(tab_shunt_label, active_loco->name.c_str());
@@ -918,8 +964,10 @@ void create_gui(lv_obj_t* screen) {
     lv_create_tab_address(tab_loco);
   }
   lv_create_tab_shunt(tab_shunt);
-  lv_create_tab_pom(tab_pom);
+  lv_obj_add_state(tab_shunt, LV_STATE_DISABLED);
   lv_create_tab_fn(tab_fn);
+  lv_obj_add_state(tab_fn, LV_STATE_DISABLED);
+  lv_create_tab_pom(tab_pom);
   lv_create_tab_info(tab_info);
 }
 
@@ -960,7 +1008,7 @@ PAIRING_STATUS autoPair() {
 
     case PAIR_REQUEST:
       pairing_status = PAIR_REQUESTED;
-      pairing_timeout = millis() + 1e3;
+      pairing_timeout = millis() + PAIRING_FREQ;
       break;
 
     case PAIR_REQUESTED:
@@ -996,7 +1044,7 @@ void get_mac(uint8_t* mac) {
 void setup() {
   Serial.begin(115200);
 
-  int32_t timeout = millis() + 5000;
+  int32_t timeout = millis() + SD_TIMEOUT;
   while (!SD.begin(SD_CS) && millis() < timeout) {
     delay(1100);
   }
@@ -1039,13 +1087,24 @@ void setup() {
 
 void loop() {
   if (autoPair() == PAIRED) {
-    // set_label_espnow(pairing_status);
     if (strlen(temp_cmd)) {
       send_outgoing(temp_cmd);
       *temp_cmd = 0x0;
     }
   }
   if (active_loco == NULL) {
+    if (lv_tabview_get_tab_active(tabview) == 1 or lv_tabview_get_tab_active(tabview) == 2) {
+      lv_tabview_set_active(tabview, 0, LV_ANIM_OFF);
+    }
+    lv_obj_add_state(tab_shunt, LV_STATE_DISABLED);
+    lv_obj_add_state(tab_fn, LV_STATE_DISABLED);
+  } else {
+    if (lv_obj_has_state(tab_shunt, LV_STATE_DISABLED)) {
+      lv_obj_remove_state(tab_shunt, LV_STATE_DISABLED);
+    }
+    if (lv_obj_has_state(tab_fn, LV_STATE_DISABLED)) {
+      lv_obj_remove_state(tab_fn, LV_STATE_DISABLED);
+    }
   }
   lv_timer_handler();  // let the GUI do its work
   lv_tick_inc(5);      // tell LVGL how much time has passed
