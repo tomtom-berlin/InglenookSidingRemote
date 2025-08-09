@@ -21,6 +21,9 @@ Die Kommunikation ist unverschlüsselt
         <<<QUIT>>> Layout und Fernbedienung ausschalten
 */
 
+#define CYD_1
+#define ROT_90DEG
+
 #include <lvgl.h>
 #include <TFT_eSPI.h>
 #include <XPT2046_Touchscreen.h>
@@ -29,6 +32,7 @@ Die Kommunikation ist unverschlüsselt
 #include <SPI.h>
 #include <esp_now.h>
 #include <WiFi.h>
+#include "cyd-calibration.h"
 
 enum PAIRING_STATUS {
   UNKNOWN,
@@ -62,12 +66,13 @@ typedef struct {
 
 typedef struct {
   uint8_t msg_type;
+  uint8_t client_id;
   uint8_t mac[6];
   int length;
   char txt[224];
 } MESSAGE_TYPE;
 
-const char* VERSION[] = { "0", "5&", "20250808.1610" };
+const char* VERSION[] = { "0", "5&", "20250809.2050" };
 
 #define FONT_SMALL &lv_font_montserrat_10
 #define FONT_H3 &lv_font_montserrat_20
@@ -200,6 +205,8 @@ void OnDataRecv(uint8_t* mac_addr, uint8_t* incomingData, uint8_t length) {
   Serial.print(" Bytes received, ");
   Serial.print("Msg Type ");
   Serial.print(incoming.msg_type);
+  Serial.print(", Client ");
+  Serial.print(incoming.client_id);
   Serial.print(", Sender MAC: ");
   snprintf(temp_label, sizeof(temp_label), "%X:%X:%X:%X:%X:%X, ",
            *(incoming.mac + 0),
@@ -217,15 +224,19 @@ void OnDataRecv(uint8_t* mac_addr, uint8_t* incomingData, uint8_t length) {
   Serial.print(" Bytes, Command: ");
   Serial.println(incoming.txt);
   if (incoming.msg_type == PAIRING) {
-    esp_now_del_peer(broadcastAddress);
-    memcpy(peer.peer_addr, peerAddress, 6);
-    peer.channel = 0;
-    peer.encrypt = false;
-    memcpy(broadcastAddress, peerAddress, 6);
-    esp_now_add_peer(&peer);
-    pairing_status = PAIRED;
-  }
-  else if (incoming.msg_type == DATA) {  // Get loco state if applicable
+    if (incoming.client_id == 0) { // nur auf Server-Antwort reagieren
+      esp_now_del_peer(broadcastAddress);
+      memcpy(peer.peer_addr, peerAddress, 6);
+      peer.channel = 0;
+      peer.encrypt = false;
+      memcpy(broadcastAddress, peerAddress, 6);
+      esp_now_add_peer(&peer);
+      pairing_status = PAIRED;
+    }
+    else {
+      pairing_status = NOT_PAIRED;
+    }
+  } else if (incoming.msg_type == DATA) {  // Get loco state if applicable
   }
 }
 
@@ -284,7 +295,19 @@ void touchscreen_read(lv_indev_t* indev, lv_indev_data_t* data) {
   if (touchscreen.tirqTouched() && touchscreen.touched()) {
     // Get Touchscreen points
     TS_Point p = touchscreen.getPoint();
-    // Calibrate Touchscreen points with map function to the correct width and height
+
+    // Calibrate Touchscreen points
+    x = alpha_y * p.x + beta_y * p.y + delta_y;
+    // clamp x between 0 and SCREEN_WIDTH - 1
+    x = max(0, x);
+    x = min(SCREEN_WIDTH - 1, x);
+
+    y = alpha_x * p.x + beta_x * p.y + delta_x;
+    // clamp y between 0 and SCREEN_HEIGHT - 1
+    y = max(0, y);
+    y = min(SCREEN_HEIGHT - 1, y);
+
+
     x = map(p.x, 200, 3700, 1, SCREEN_WIDTH);
     y = map(p.y, 240, 3800, 1, SCREEN_HEIGHT);
     z = p.z;
@@ -309,7 +332,7 @@ void touchscreen_read(lv_indev_t* indev, lv_indev_data_t* data) {
 }
 
 void halt() {
-    // stop last active loco
+  // stop last active loco
   if (active_loco != NULL) {
     char_cnt = snprintf(temp_cmd, sizeof(temp_cmd), "<<<L%d,H", active_loco->address);
     for (int i = 0; i < sizeof(btnm_map) / sizeof(btnm_map[0]); i++) {
@@ -975,6 +998,7 @@ void send_outgoing(char* text) {
   Serial.println(text);
   memset((void*)&outgoing, 0x0, sizeof(outgoing));
   outgoing.msg_type = msg_type;
+  outgoing.client_id = REMOTE_BOARD;
   memcpy(outgoing.mac, myAddress, 6);
   outgoing.length = strlen(text);
   memcpy(outgoing.txt, text, strlen(text));
@@ -1003,6 +1027,7 @@ PAIRING_STATUS autoPair() {
       }
       snprintf(temp_cmd, sizeof(temp_cmd), "Rangierer_%d", REMOTE_BOARD);
       send_outgoing(temp_cmd);
+      *temp_cmd = '\0';
       pairing_status = PAIR_REQUEST;
       break;
 
